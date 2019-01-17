@@ -6,18 +6,18 @@
  * Defines Func - the front-end handle on a halide function, and related classes.
  */
 
-#include "IR.h"
-#include "Var.h"
-#include "Function.h"
-#include "Param.h"
 #include "Argument.h"
-#include "RDom.h"
+#include "Function.h"
+#include "IR.h"
+#include "IROperator.h"
 #include "JITModule.h"
+#include "Module.h"
+#include "Param.h"
+#include "Pipeline.h"
+#include "RDom.h"
 #include "Target.h"
 #include "Tuple.h"
-#include "IROperator.h"
-#include "Module.h"
-#include "Pipeline.h"
+#include "Var.h"
 
 #include <map>
 
@@ -49,7 +49,7 @@ class ImageParam;
 namespace Internal {
 struct Split;
 struct StorageDim;
-}
+}  // namespace Internal
 
 /** A single definition of a Func. May be a pure or update definition. */
 class Stage {
@@ -79,6 +79,7 @@ public:
     Stage(Internal::Function f, Internal::Definition d, size_t stage_index,
           const std::vector<Var> &args)
             : function(f), definition(d), stage_index(stage_index), dim_vars(args) {
+        internal_assert(definition.defined());
         internal_assert(definition.args().size() == dim_vars.size());
         definition.schedule().touched() = true;
     }
@@ -86,6 +87,7 @@ public:
     Stage(Internal::Function f, Internal::Definition d, size_t stage_index,
           const std::vector<std::string> &args)
             : function(f), definition(d), stage_index(stage_index) {
+        internal_assert(definition.defined());
         definition.schedule().touched() = true;
 
         std::vector<Var> dim_vars(args.size());
@@ -190,6 +192,27 @@ public:
      * exact schedule from the outermost to the innermost fused dimension, and
      * the stage we are calling compute_with on should not have specializations,
      * e.g. f2.compute_with(f1, x) is allowed only if f2 has no specializations.
+     *
+     * Also, if a producer is desired to be computed at the fused loop level,
+     * the function passed to the compute_at() needs to be the "parent". Consider
+     * the following code:
+     \code
+     input(x, y) = x + y;
+     f(x, y) = input(x, y);
+     f(x, y) += 5;
+     g(x, y) = x - y;
+     g(x, y) += 10;
+     f.compute_with(g, y);
+     f.update().compute_with(g.update(), y);
+     \endcode
+     *
+     * To compute 'input' at the fused loop level at dimension y, we specify
+     * input.compute_at(g, y) instead of input.compute_at(f, y) since 'g' is
+     * the "parent" for this fused loop (i.e. 'g' is computed first before 'f'
+     * is computed). On the other hand, to compute 'input' at the innermost
+     * dimension of 'f', we specify input.compute_at(f, x) instead of
+     * input.compute_at(g, x) since the x dimension of 'f' is not fused
+     * (only the y dimension is).
      *
      * Given the constraints, this has a variety of uses. Consider the
      * following code:
@@ -607,7 +630,7 @@ public:
 namespace Internal {
 struct ErrorBuffer;
 class IRMutator2;
-}
+}  // namespace Internal
 
 /** A halide function. This class represents one stage in a Halide
  * pipeline, and is the unit by which we schedule things. By default
@@ -860,6 +883,12 @@ public:
                                  const std::vector<Argument> &args,
                                  StmtOutputFormat fmt = Text,
                                  const Target &target = get_target_from_environment());
+
+    /** Emit a Python Extension glue .c file. */
+    void compile_to_python_extension(const std::string &filename_prefix,
+                                     const std::vector<Argument> &args,
+                                     const std::string &fn_name,
+                                     const Target &target = get_target_from_environment());
 
     /** Write out the loop nests specified by the schedule for this
      * Function. Helpful for understanding what a schedule is
@@ -1121,80 +1150,40 @@ public:
      * fftw. */
     // @{
     void define_extern(const std::string &function_name,
-                       const std::vector<ExternFuncArgument> &params,
-                       Type t,
-                       int dimensionality,
-                       NameMangling mangling,
-                       bool uses_old_buffer_t) {
-        define_extern(function_name, params, t,
-                      Internal::make_argument_list(dimensionality),
-                      mangling, uses_old_buffer_t);
-    }
-
-    void define_extern(const std::string &function_name,
-                       const std::vector<ExternFuncArgument> &params,
-                       Type t,
+                       const std::vector<ExternFuncArgument> &params, Type t,
                        int dimensionality,
                        NameMangling mangling = NameMangling::Default,
-                       DeviceAPI device_api = DeviceAPI::Host,
-                       bool uses_old_buffer_t = false) {
-        define_extern(function_name, params, t,
-                      Internal::make_argument_list(dimensionality),
-                      mangling, device_api, uses_old_buffer_t);
+                       DeviceAPI device_api = DeviceAPI::Host) {
+      define_extern(function_name, params, t,
+                    Internal::make_argument_list(dimensionality), mangling,
+                    device_api);
     }
 
     void define_extern(const std::string &function_name,
                        const std::vector<ExternFuncArgument> &params,
-                       const std::vector<Type> &types,
-                       int dimensionality,
-                       NameMangling mangling,
-                       bool uses_old_buffer_t) {
-        define_extern(function_name, params, types,
-                      Internal::make_argument_list(dimensionality),
-                      mangling, uses_old_buffer_t);
-    }
-
-    void define_extern(const std::string &function_name,
-                       const std::vector<ExternFuncArgument> &params,
-                       const std::vector<Type> &types,
-                       int dimensionality,
-                       NameMangling mangling = NameMangling::Default,
-                       DeviceAPI device_api = DeviceAPI::Host,
-                       bool uses_old_buffer_t = false) {
-        define_extern(function_name, params, types,
-                      Internal::make_argument_list(dimensionality),
-                      mangling, device_api, uses_old_buffer_t);
-    }
-
-    void define_extern(const std::string &function_name,
-                       const std::vector<ExternFuncArgument> &params,
-                       Type t,
-                       const std::vector<Var> &arguments,
-                       NameMangling mangling,
-                       bool uses_old_buffer_t) {
-        define_extern(function_name, params, std::vector<Type>{t},
-                      arguments, mangling, uses_old_buffer_t);
-    }
-
-    void define_extern(const std::string &function_name,
-                       const std::vector<ExternFuncArgument> &params,
-                       Type t,
-                       const std::vector<Var> &arguments,
-                       NameMangling mangling = NameMangling::Default,
-                       DeviceAPI device_api = DeviceAPI::Host,
-                       bool uses_old_buffer_t = false) {
-        define_extern(function_name, params, std::vector<Type>{t},
-                      arguments, mangling, device_api, uses_old_buffer_t);
-    }
-
-    void define_extern(const std::string &function_name,
-                       const std::vector<ExternFuncArgument> &params,
-                       const std::vector<Type> &types,
-                       const std::vector<Var> &arguments,
-                       NameMangling mangling,
-                       bool uses_old_buffer_t) {
+                       const std::vector<Type> &types, int dimensionality,
+                       NameMangling mangling) {
       define_extern(function_name, params, types,
-                    arguments, mangling, DeviceAPI::Host, uses_old_buffer_t);
+                    Internal::make_argument_list(dimensionality), mangling);
+    }
+
+    void define_extern(const std::string &function_name,
+                       const std::vector<ExternFuncArgument> &params,
+                       const std::vector<Type> &types, int dimensionality,
+                       NameMangling mangling = NameMangling::Default,
+                       DeviceAPI device_api = DeviceAPI::Host) {
+      define_extern(function_name, params, types,
+                    Internal::make_argument_list(dimensionality), mangling,
+                    device_api);
+    }
+
+    void define_extern(const std::string &function_name,
+                       const std::vector<ExternFuncArgument> &params, Type t,
+                       const std::vector<Var> &arguments,
+                       NameMangling mangling = NameMangling::Default,
+                       DeviceAPI device_api = DeviceAPI::Host) {
+      define_extern(function_name, params, std::vector<Type>{t}, arguments,
+                    mangling, device_api);
     }
 
     void define_extern(const std::string &function_name,
@@ -1202,8 +1191,7 @@ public:
                        const std::vector<Type> &types,
                        const std::vector<Var> &arguments,
                        NameMangling mangling = NameMangling::Default,
-                       DeviceAPI device_api = DeviceAPI::Host,
-                       bool uses_old_buffer_t = false);
+                       DeviceAPI device_api = DeviceAPI::Host);
     // @}
 
     /** Get the types of the outputs of this Func. */
@@ -2086,6 +2074,24 @@ public:
      */
     Func &memoize();
 
+    /** Produce this Func asynchronously in a separate
+     * thread. Consumers will be run by the task system when the
+     * production is complete. If this Func's store level is different
+     * to its compute level, consumers will be run concurrently,
+     * blocking as necessary to prevent reading ahead of what the
+     * producer has computed. If storage is folded, then the producer
+     * will additionally not be permitted to run too far ahead of the
+     * consumer, to avoid clobbering data that has not yet been
+     * used.
+     *
+     * Take special care when combining this with custom thread pool
+     * implementations, as avoiding deadlock with producer-consumer
+     * parallelism requires a much more sophisticated parallel runtime
+     * than with data parallelism alone. It is strongly recommended
+     * you just use Halide's default thread pool, which guarantees no
+     * deadlock and a bound on the number of threads launched.
+     */
+    Func &async();
 
     /** Allocate storage for this function within f's loop over
      * var. Scheduling storage is optional, and can be used to
@@ -2291,6 +2297,11 @@ public:
     /** Get the source location of the pure definition of this
      * Func. See Stage::source_location() */
     std::string source_location() const;
+
+    /** Return the current StageSchedule associated with this initial
+     * Stage of this Func. For introspection only: to modify schedule,
+     * use the Func interface. */
+    const Internal::StageSchedule &get_schedule() const { return Stage(*this).get_schedule(); }
 };
 
 namespace Internal {
@@ -2398,7 +2409,6 @@ HALIDE_NO_USER_CODE_INLINE void evaluate_may_gpu(Tuple t, First first, Rest&&...
 }
 // @}
 
-}
-
+}  // namespace Halide
 
 #endif

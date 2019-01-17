@@ -27,20 +27,61 @@
  *       be doable.
  */
 
+// Copied from tsan_interface.h
+#ifndef TSAN_ANNOTATIONS
+#define TSAN_ANNOTATIONS 0
+#endif
+
+#if TSAN_ANNOTATIONS
+extern "C" {
+  const unsigned __tsan_mutex_linker_init      = 1 << 0;
+  void __tsan_mutex_pre_lock(void *addr, unsigned flags);
+  void __tsan_mutex_post_lock(void *addr, unsigned flags, int recursion);
+  int __tsan_mutex_pre_unlock(void *addr, unsigned flags);
+  void __tsan_mutex_post_unlock(void *addr, unsigned flags);
+  void __tsan_mutex_pre_signal(void *addr, unsigned flags);
+  void __tsan_mutex_post_signal(void *addr, unsigned flags);
+}
+#endif
+
 namespace Halide { namespace Runtime { namespace Internal {
 
 namespace Synchronization {
 
 namespace {
 
+#if TSAN_ANNOTATIONS
+  __attribute__((always_inline)) void if_tsan_pre_lock(void *mutex) { __tsan_mutex_pre_lock(mutex, __tsan_mutex_linker_init); };
+  // TODO(zalman|dvyukov): Is 1 the right value for a non-recursive lock? pretty sure value is ignored.
+  __attribute__((always_inline)) void if_tsan_post_lock(void *mutex) { __tsan_mutex_post_lock(mutex, __tsan_mutex_linker_init, 1); }
+  // TODO(zalman|dvyukov): Is it safe to ignore return value here if locks are not recursive?
+  __attribute__((always_inline)) void if_tsan_pre_unlock(void *mutex) { (void)__tsan_mutex_pre_unlock(mutex, __tsan_mutex_linker_init); }
+  __attribute__((always_inline)) void if_tsan_post_unlock(void *mutex) { __tsan_mutex_post_unlock(mutex, __tsan_mutex_linker_init); }
+  __attribute__((always_inline)) void if_tsan_pre_signal(void *cond) { __tsan_mutex_pre_signal(cond, 0); }
+  __attribute__((always_inline)) void if_tsan_post_signal(void *cond) { __tsan_mutex_post_signal(cond, 0); }
+#else
+  __attribute__((always_inline)) void if_tsan_pre_lock(void *) { }
+  __attribute__((always_inline)) void if_tsan_post_lock(void *) { }
+  __attribute__((always_inline)) void if_tsan_pre_unlock(void *) { }
+  __attribute__((always_inline)) void if_tsan_post_unlock(void *) { }
+  __attribute__((always_inline)) void if_tsan_pre_signal(void *) { }
+  __attribute__((always_inline)) void if_tsan_post_signal(void *) { }
+#endif
+
 #ifdef BITS_32
 __attribute__((always_inline))  uintptr_t atomic_and_fetch_release(uintptr_t *addr, uintptr_t val) {
     return __sync_and_and_fetch(addr, val);
 }
 
-__attribute__((always_inline)) bool cas_strong_sequentially_consistent_helper(uintptr_t *addr, uintptr_t *expected, uintptr_t *desired) {
-    uintptr_t oldval = *expected;
-    uintptr_t gotval = __sync_val_compare_and_swap(addr, oldval, *desired);
+template <typename T>
+__attribute__((always_inline)) T atomic_fetch_add_acquire_release(T *addr, T val) {
+    return __sync_fetch_and_add(addr, val);
+}
+
+template <typename T>
+__attribute__((always_inline)) bool cas_strong_sequentially_consistent_helper(T *addr, T *expected, T *desired) {
+    T oldval = *expected;
+    T gotval = __sync_val_compare_and_swap(addr, oldval, *desired);
     *expected = gotval;
     return oldval == gotval;
 }
@@ -48,9 +89,14 @@ __attribute__((always_inline)) bool cas_strong_sequentially_consistent_helper(ui
  __attribute__((always_inline)) bool atomic_cas_strong_release_relaxed(uintptr_t *addr, uintptr_t *expected, uintptr_t *desired) {
      return cas_strong_sequentially_consistent_helper(addr, expected, desired);
 }
-      
+
 __attribute__((always_inline)) bool atomic_cas_weak_release_relaxed(uintptr_t *addr, uintptr_t *expected, uintptr_t *desired) {
      return cas_strong_sequentially_consistent_helper(addr, expected, desired);
+}
+
+template <typename T>
+__attribute__((always_inline)) bool atomic_cas_weak_relacq_relaxed(T *addr, T *expected, T *desired) {
+    return cas_strong_sequentially_consistent_helper(addr, expected, desired);
 }
 
 __attribute__((always_inline)) bool atomic_cas_weak_relaxed_relaxed(uintptr_t *addr, uintptr_t *expected, uintptr_t *desired) {
@@ -65,7 +111,14 @@ __attribute__((always_inline)) uintptr_t atomic_fetch_and_release(uintptr_t *add
     return __sync_fetch_and_and(addr, val);
 }
 
-__attribute__((always_inline)) void atomic_load_relaxed(uintptr_t *addr, uintptr_t *val) {
+template <typename T>
+__attribute__((always_inline)) void atomic_load_relaxed(T *addr, T *val) {
+    *val = *addr;
+}
+
+template <typename T>
+__attribute__((always_inline)) void atomic_load_acquire(T *addr, T *val) {
+    __sync_synchronize();
     *val = *addr;
 }
 
@@ -77,7 +130,8 @@ __attribute__((always_inline)) void atomic_store_relaxed(uintptr_t *addr, uintpt
     *addr = *val;
 }
 
-__attribute__((always_inline)) void atomic_store_release(uintptr_t *addr, uintptr_t *val) {
+template <typename T>
+__attribute__((always_inline)) void atomic_store_release(T *addr, T *val) {
     *addr = *val;
     __sync_synchronize();
 }
@@ -92,10 +146,20 @@ __attribute__((always_inline))  uintptr_t atomic_and_fetch_release(uintptr_t *ad
     return __atomic_and_fetch(addr, val, __ATOMIC_RELEASE);
 }
 
+template <typename T>
+__attribute__((always_inline))  T atomic_fetch_add_acquire_release(T *addr, T val) {
+    return __atomic_fetch_add(addr, val, __ATOMIC_ACQ_REL);
+}
+
 __attribute__((always_inline)) bool atomic_cas_strong_release_relaxed(uintptr_t *addr, uintptr_t *expected, uintptr_t *desired) {
     return __atomic_compare_exchange(addr, expected, desired, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
-      
+
+template <typename T>
+__attribute__((always_inline)) bool atomic_cas_weak_relacq_relaxed(T *addr, T *expected, T *desired) {
+    return __atomic_compare_exchange(addr, expected, desired, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
 __attribute__((always_inline)) bool atomic_cas_weak_release_relaxed(uintptr_t *addr, uintptr_t *expected, uintptr_t *desired) {
     return __atomic_compare_exchange(addr, expected, desired, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
@@ -112,8 +176,14 @@ __attribute__((always_inline)) uintptr_t atomic_fetch_and_release(uintptr_t *add
     return __atomic_fetch_and(addr, val, __ATOMIC_RELEASE);
 }
 
-__attribute__((always_inline)) void atomic_load_relaxed(uintptr_t *addr, uintptr_t *val) {
+template <typename T>
+__attribute__((always_inline)) void atomic_load_relaxed(T *addr, T *val) {
     __atomic_load(addr, val, __ATOMIC_RELAXED);
+}
+
+template <typename T>
+__attribute__((always_inline)) void atomic_load_acquire(T *addr, T *val) {
+    __atomic_load(addr, val, __ATOMIC_ACQUIRE);
 }
 
 __attribute__((always_inline)) uintptr_t atomic_or_fetch_relaxed(uintptr_t *addr, uintptr_t val) {
@@ -124,7 +194,8 @@ __attribute__((always_inline)) void atomic_store_relaxed(uintptr_t *addr, uintpt
     __atomic_store(addr, val, __ATOMIC_RELAXED);
 }
 
-__attribute__((always_inline)) void atomic_store_release(uintptr_t *addr, uintptr_t *val) {
+template <typename T>
+__attribute__((always_inline)) void atomic_store_release(T *addr, T *val) {
     __atomic_store(addr, val, __ATOMIC_RELEASE);
 }
 
@@ -135,7 +206,7 @@ __attribute__((always_inline)) void atomic_thread_fence_acquire() {
 #endif
 
 }
- 
+
 class spin_control {
     int spin_count;
 
@@ -203,15 +274,21 @@ class word_lock {
 public:
     word_lock() : state(0) {}
     __attribute__((always_inline)) void lock() {
+        if_tsan_pre_lock(this);
+
         uintptr_t expected = 0;
         uintptr_t desired = lock_bit;
         // Try for a fast grab of the lock bit. If this does not work, call the full adaptive looping code.
         if (!atomic_cas_weak_acquire_relaxed(&state, &expected, &desired)) {
             lock_full();
         }
+
+        if_tsan_post_lock(this);
     }
 
     __attribute__((always_inline)) void unlock() {
+        if_tsan_pre_unlock(this);
+
         uintptr_t val = atomic_fetch_and_release(&state, ~(uintptr_t)lock_bit);
         // If another thread is currently queueing, that thread will ensure
         // it acquires the lock or wakes a waiting thread.
@@ -221,6 +298,8 @@ public:
         if (no_thread_queuing && some_queued) {
             unlock_full();
         }
+
+        if_tsan_post_unlock(this);
     }
 
 };
@@ -299,9 +378,7 @@ WEAK void word_lock::unlock_full() {
         int times_through = 0;
         while (tail == NULL) {
             word_lock_queue_data *next = current->next;
-            if (next == NULL) {
-                abort();
-            }
+            halide_assert(NULL, next != NULL);
             next->prev = current;
             current = next;
             tail = current->tail;
@@ -313,7 +390,7 @@ WEAK void word_lock::unlock_full() {
         // that currently holds the lock do the wakeup
         if (expected & lock_bit) {
             uintptr_t desired = expected & ~(uintptr_t)queue_lock_bit;
-            if (atomic_cas_weak_release_relaxed(&state, &expected, &desired)) {
+            if (atomic_cas_weak_relacq_relaxed(&state, &expected, &desired)) {
                 return;
             }
             atomic_thread_fence_acquire();
@@ -325,7 +402,7 @@ WEAK void word_lock::unlock_full() {
             bool continue_outer = false;
             while (!continue_outer) {
                 uintptr_t desired = expected & lock_bit;
-                if (atomic_cas_weak_release_relaxed(&state, &expected, &desired)) {
+                if (atomic_cas_weak_relacq_relaxed(&state, &expected, &desired)) {
                     break;
                 }
                 if ((expected & ~(uintptr_t)(queue_lock_bit | lock_bit)) == 0) {
@@ -372,7 +449,7 @@ struct queue_data {
 
 struct hash_bucket {
     word_lock mutex;
-    
+
     queue_data *head; // Is this queue_data or thread_data?
     queue_data *tail; // Is this queue_data or thread_data?
 };
@@ -386,7 +463,7 @@ struct hash_table {
     hash_bucket buckets[MAX_THREADS * LOAD_FACTOR];
 };
 WEAK char table_storage[sizeof(hash_table)];
-#define table (*(hash_table *)table_storage) 
+#define table (*(hash_table *)table_storage)
 
 inline void check_hash(uintptr_t hash) {
     halide_assert(NULL, hash < sizeof(table.buckets)/sizeof(table.buckets[0]));
@@ -485,7 +562,7 @@ struct validate_action {
     bool unpark_one;
     uintptr_t invalid_unpark_info;
 
-  __attribute__((always_inline)) validate_action() : unpark_one(false), invalid_unpark_info(0) { }
+    __attribute__((always_inline)) validate_action() : unpark_one(false), invalid_unpark_info(0) { }
 };
 
 WEAK bool parking_control_validate(void *control, validate_action &action) { return true; };
@@ -499,7 +576,7 @@ struct parking_control {
     uintptr_t (*unpark)(void *control, int unparked, bool more_waiters);
     void (*requeue_callback)(void *control, const validate_action &action, bool one_to_wake, bool some_requeued);
 
-    parking_control() : validate(parking_control_validate), before_sleep(parking_control_before_sleep),
+    __attribute__((always_inline)) parking_control() : validate(parking_control_validate), before_sleep(parking_control_before_sleep),
         unpark(parking_control_unpark), requeue_callback(parking_control_requeue_callback) {
     }
 };
@@ -732,7 +809,7 @@ WEAK uintptr_t mutex_parking_control_unpark(void *control, int unparked, bool mo
 struct mutex_parking_control : parking_control {
     uintptr_t *lock_state;
 
-    mutex_parking_control(uintptr_t *lock_state)
+    __attribute__((always_inline)) mutex_parking_control(uintptr_t *lock_state)
         : lock_state(lock_state) {
         validate = mutex_parking_control_validate;
         unpark = mutex_parking_control_unpark;
@@ -783,7 +860,7 @@ class fast_mutex {
                 atomic_load_relaxed(&state, &expected);
                 continue;
             }
-            
+
             // Mark mutex as having parked threads if not already done.
             if ((expected & parked_bit) == 0) {
                 uintptr_t desired = expected | parked_bit;
@@ -979,23 +1056,30 @@ class fast_cond {
     __attribute__((always_inline)) fast_cond() : state(0) { }
 
     __attribute__((always_inline)) void signal() {
+        if_tsan_pre_signal(this);
+
         uintptr_t val;
         atomic_load_relaxed(&state, &val);
         if (val == 0) {
+            if_tsan_post_signal(this);
             return;
         }
         signal_parking_control control(&state, (fast_mutex *)val);
         unpark_one((uintptr_t)this, control);
+        if_tsan_post_signal(this);
     }
 
     __attribute__((always_inline)) void broadcast() {
+        if_tsan_pre_signal(this);
         uintptr_t val;
         atomic_load_relaxed(&state, &val);
         if (val == 0) {
+            if_tsan_post_signal(this);
             return;
         }
         broadcast_parking_control control(&state, (fast_mutex *)val);
         unpark_requeue((uintptr_t)this, val, control, 0);
+        if_tsan_post_signal(this);
     }
 
     __attribute__((always_inline)) void wait(fast_mutex *mutex) {
@@ -1003,10 +1087,15 @@ class fast_cond {
         uintptr_t result = park((uintptr_t)this, control);
         if (result != (uintptr_t)mutex) {
             mutex->lock();
-        } else { // TODO: this is debug only.
+        } else {
+            if_tsan_pre_lock(mutex);
+
+            // TODO: this is debug only.
             uintptr_t val;
             atomic_load_relaxed((uintptr_t *)mutex, &val);
             halide_assert(NULL, val & 0x1);
+
+            if_tsan_post_lock(mutex);
         }
     }
 };

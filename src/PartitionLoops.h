@@ -12,6 +12,10 @@
 namespace Halide {
 namespace Internal {
 
+/** Return true if an expression uses a likely tag that isn't captured
+ * by an enclosing Select, Min, or Max. */
+bool has_uncaptured_likely_tag(Expr e);
+
 /** Return true if an expression uses a likely tag. */
 bool has_likely_tag(Expr e);
 
@@ -20,7 +24,7 @@ bool has_likely_tag(Expr e);
  * ramps, or the 'likely' intrinsic. */
 Stmt partition_loops(Stmt s);
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide
 
 #endif

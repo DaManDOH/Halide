@@ -18,7 +18,7 @@ ParamMap::ParamMap(const std::initializer_list<ParamMapping> &init) {
 }
 
 void ParamMap::set(const ImageParam &p, Buffer<> &buf, Buffer<> *buf_out_param) {
-    Internal::Parameter v(p.type(), true, p.dimensions(), p.name(), p.is_explicit_name());
+    Internal::Parameter v(p.type(), true, p.dimensions(), p.name());
     v.set_buffer(buf);
     ParamArg pa;
     pa.mapped_param = v;
@@ -48,4 +48,4 @@ Internal::Parameter &ParamMap::map(Internal::Parameter &p, Buffer<> *&buf_out_pa
     }
 }
 
-}
+}  // namespace Halide

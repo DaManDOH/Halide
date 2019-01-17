@@ -1,20 +1,20 @@
 #include <algorithm>
 #include <set>
 
-#include "RealizationOrder.h"
 #include "FindCalls.h"
 #include "Func.h"
-#include "IRVisitor.h"
 #include "IREquality.h"
+#include "IRVisitor.h"
+#include "RealizationOrder.h"
 
 namespace Halide {
 namespace Internal {
 
-using std::string;
 using std::map;
-using std::set;
-using std::vector;
 using std::pair;
+using std::set;
+using std::string;
+using std::vector;
 
 namespace {
 
@@ -76,7 +76,7 @@ void realization_order_dfs(string current,
         } else {
             internal_assert(result_set.find(fn) != result_set.end())
                 << "Stuck in a loop computing a realization order. "
-                << "Perhaps this pipeline has a loop?\n";
+                << "Perhaps this pipeline has a loop involving " << current << "?\n";
         }
     }
 
@@ -346,5 +346,5 @@ vector<string> topological_order(const vector<Function> &outputs,
     return order;
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide

@@ -14,11 +14,11 @@
  * Various utility functions used internally Halide. */
 
 #include <cstdint>
-#include <utility>
-#include <vector>
-#include <string>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "runtime/HalideRuntime.h"
 
@@ -62,10 +62,10 @@ DST safe_numeric_cast(SRC s) {
         // in different ways by different compilers, so an arbitrary but safe
         // choice like this is reasonable.
         if (s < (SRC) std::numeric_limits<DST>::min()) {
-          return std::numeric_limits<DST>::min();
+            return std::numeric_limits<DST>::min();
         }
         if (s > (SRC) std::numeric_limits<DST>::max()) {
-          return std::numeric_limits<DST>::max();
+            return std::numeric_limits<DST>::max();
         }
     }
     return (DST) s;
@@ -134,6 +134,9 @@ std::string running_program_name();
 std::string unique_name(char prefix);
 std::string unique_name(const std::string &prefix);
 // @}
+
+/** Reset the unique name counters to zeros. */
+void reset_unique_name_counters();
 
 /** Test if the first string starts with the second string */
 bool starts_with(const std::string &str, const std::string &prefix);
@@ -305,6 +308,9 @@ struct ScopedValue {
     ScopedValue(T &var, T new_value) : var(var), old_value(var) { var = new_value; }
     ~ScopedValue() { var = old_value; }
     operator T() const { return old_value; }
+    // allow move but not copy
+    ScopedValue(const ScopedValue& that) = delete;
+    ScopedValue(ScopedValue&& that) = default;
 };
 
 // Wrappers for some C++14-isms that are useful and trivially implementable

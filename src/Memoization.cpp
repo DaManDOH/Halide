@@ -17,7 +17,7 @@ namespace {
 class FindParameterDependencies : public IRGraphVisitor {
 public:
     FindParameterDependencies() { }
-    ~FindParameterDependencies() { }
+    ~FindParameterDependencies() override { }
 
     void visit_function(const Function &function) {
         function.accept(this);
@@ -40,7 +40,7 @@ public:
 
     using IRGraphVisitor::visit;
 
-    void visit(const Call *call) {
+    void visit(const Call *call) override {
         if (call->param.defined()) {
             record(call->param);
         }
@@ -65,14 +65,14 @@ public:
     }
 
 
-    void visit(const Load *load) {
+    void visit(const Load *load) override {
         if (load->param.defined()) {
             record(load->param);
         }
         IRGraphVisitor::visit(load);
     }
 
-    void visit(const Variable *var) {
+    void visit(const Variable *var) override {
         if (var->param.defined()) {
             record(var->param);
         }
@@ -533,5 +533,5 @@ Stmt rewrite_memoized_allocations(Stmt s, const std::map<std::string, Function> 
     return rewriter.mutate(s);
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide

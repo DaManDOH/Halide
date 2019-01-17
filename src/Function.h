@@ -5,14 +5,14 @@
  * Defines the internal representation of a halide function and related classes
  */
 
-#include "Expr.h"
-#include "IntrusivePtr.h"
-#include "FunctionPtr.h"
-#include "Parameter.h"
-#include "Schedule.h"
-#include "Reduction.h"
-#include "Definition.h"
 #include "Buffer.h"
+#include "Definition.h"
+#include "Expr.h"
+#include "FunctionPtr.h"
+#include "IntrusivePtr.h"
+#include "Parameter.h"
+#include "Reduction.h"
+#include "Schedule.h"
 #include "Util.h"
 
 #include <map>
@@ -217,11 +217,7 @@ public:
     /** Make a call node to the extern definition. An error if the
      * function has no extern definition. */
     Expr make_call_to_extern_definition(const std::vector<Expr> &args,
-                                               const Target &t) const;
-
-    /** Check if the extern function being called expects the legacy
-     * buffer_t type. */
-    bool extern_definition_uses_old_buffer_t() const;
+                                        const Target &t) const;
 
     /** Get the proxy Expr for the extern stage. This is an expression
      * known to have the same data access pattern as the extern
@@ -239,9 +235,7 @@ public:
                        const std::vector<ExternFuncArgument> &args,
                        const std::vector<Type> &types,
                        const std::vector<std::string> &dims,
-                       NameMangling mangling,
-                       DeviceAPI device_api,
-                       bool uses_old_buffer_t);
+                       NameMangling mangling, DeviceAPI device_api);
 
     /** Retrive the arguments of the extern definition. */
     // @{
@@ -337,6 +331,7 @@ std::pair<std::vector<Function>, std::map<std::string, Function>> deep_copy(
     const std::vector<Function> &outputs,
     const std::map<std::string, Function> &env);
 
-}}
+}  // namespace Internal
+}  // namespace Halide
 
 #endif

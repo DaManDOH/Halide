@@ -1,27 +1,30 @@
 #include "Util.h"
-#include "Introspection.h"
 #include "Debug.h"
 #include "Error.h"
-#include <sstream>
-#include <map>
+#include "Introspection.h"
 #include <atomic>
-#include <mutex>
-#include <string>
-#include <iomanip>
 #include <chrono>
+#include <iomanip>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
 
 #ifdef _MSC_VER
 #include <io.h>
 #else
-#include <unistd.h>
 #include <stdlib.h>
+#include <unistd.h>
 #endif
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
 #ifdef __linux__
 #define CAN_GET_RUNNING_PROGRAM_NAME
 #include <linux/limits.h>  // For PATH_MAX
+#endif
+#if defined(_MSC_VER) && !defined(NOMINMAX)
+#define NOMINMAX
 #endif
 #ifdef _WIN32
 #include <windows.h>
@@ -36,10 +39,10 @@
 namespace Halide {
 namespace Internal {
 
+using std::map;
+using std::ostringstream;
 using std::string;
 using std::vector;
-using std::ostringstream;
-using std::map;
 
 std::string get_env_variable(char const *env_var_name) {
     if (!env_var_name) {
@@ -101,12 +104,21 @@ namespace {
 // will get suffixes that falsely hint that they are not.
 
 const int num_unique_name_counters = (1 << 14);
-std::atomic<int> unique_name_counters[num_unique_name_counters];
+
+// We want to init these to zero, but cannot use = {0} because that
+// would invoke a (deleted) copy ctor; this syntax should force
+// the correct behavior.
+std::atomic<int> unique_name_counters[num_unique_name_counters] = {};
 
 int unique_count(size_t h) {
     h = h & (num_unique_name_counters - 1);
     return unique_name_counters[h]++;
 }
+}  // namespace
+
+void reset_unique_name_counters() {
+    for (int i = 0; i < num_unique_name_counters; ++i)
+        unique_name_counters[i].store(0);
 }
 
 // There are three possible families of names returned by the methods below:
@@ -166,8 +178,6 @@ string unique_name(const std::string &prefix) {
 
     return sanitized + "$" + std::to_string(count);
 }
-
-
 
 bool starts_with(const string &str, const string &prefix) {
     if (str.size() < prefix.size()) return false;
@@ -463,5 +473,5 @@ void halide_toc_impl(const char *file, int line) {
     debug(0) << t1.file << ":" << t1.line << " ... " << f << ":" << line << " : " << diff.count() * 1000 << " ms\n";
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide

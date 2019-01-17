@@ -8,10 +8,9 @@
 
 #include "Argument.h"
 #include "Dimension.h"
-#include "runtime/HalideRuntime.h"
-#include "Var.h"
-#include "Dimension.h"
 #include "Func.h"
+#include "Var.h"
+#include "runtime/HalideRuntime.h"
 
 namespace Halide {
 
@@ -22,7 +21,7 @@ protected:
     friend class Func;
 
     /** A reference-counted handle on the internal parameter object */
-    Internal::RegisteredParameter param;
+    Internal::Parameter param;
 
     /** Is this an input or an output? OutputImageParam is the base class for both. */
     Argument::Kind kind;
@@ -43,7 +42,7 @@ protected:
 public:
 
     /** Construct a null image parameter handle. */
-    OutputImageParam() {}
+    OutputImageParam() : kind(Argument::InputScalar) {}
 
     /** Get the name of this Param */
     const std::string &name() const;
@@ -113,6 +112,6 @@ public:
     operator ExternFuncArgument() const;
 };
 
-}
+}  // namespace Halide
 
 #endif

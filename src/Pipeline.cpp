@@ -1,16 +1,16 @@
 #include <algorithm>
 
-#include "Pipeline.h"
 #include "Argument.h"
 #include "FindCalls.h"
 #include "Func.h"
-#include "InferArguments.h"
 #include "IRVisitor.h"
+#include "InferArguments.h"
 #include "LLVM_Headers.h"
 #include "LLVM_Output.h"
 #include "Lower.h"
 #include "Outputs.h"
 #include "ParamMap.h"
+#include "Pipeline.h"
 #include "PrintLoopNest.h"
 #include "RealizationOrder.h"
 
@@ -18,9 +18,9 @@ using namespace Halide::Internal;
 
 namespace Halide {
 
-using std::vector;
-using std::string;
 using std::set;
+using std::string;
+using std::vector;
 
 namespace {
 
@@ -92,9 +92,8 @@ struct PipelineContents {
 
     PipelineContents() :
         module("", Target()) {
-        user_context_arg.arg = Argument("__user_context", Argument::InputScalar, type_of<const void*>(), 0);
-        user_context_arg.param = Parameter(Handle(), false, 0, "__user_context",
-                                           /*is_explicit_name*/ true);
+        user_context_arg.arg = Argument("__user_context", Argument::InputScalar, type_of<const void*>(), 0, ArgumentEstimates{});
+        user_context_arg.param = Parameter(Handle(), false, 0, "__user_context");
     }
 
     ~PipelineContents() {
@@ -151,11 +150,21 @@ vector<Func> Pipeline::outputs() const {
     return funcs;
 }
 
+std::function<string(Pipeline, const Target &, const MachineParams &)> Pipeline::custom_auto_scheduler;
+
 string Pipeline::auto_schedule(const Target &target, const MachineParams &arch_params) {
+    if (custom_auto_scheduler) {
+        return custom_auto_scheduler(*this, target, arch_params);
+    }
+
     user_assert(target.arch == Target::X86 || target.arch == Target::ARM ||
                 target.arch == Target::POWERPC || target.arch == Target::MIPS)
         << "Automatic scheduling is currently supported only on these architectures.";
     return generate_schedules(contents->outputs, target, arch_params);
+}
+
+void Pipeline::set_custom_auto_scheduler(std::function<string(Pipeline, const Target &, const MachineParams &)> auto_scheduler) {
+    Pipeline::custom_auto_scheduler = auto_scheduler;
 }
 
 Func Pipeline::get_func(size_t index) {
@@ -232,6 +241,14 @@ void Pipeline::compile_to_c(const string &filename,
     m.compile(Outputs().c_source(output_name(filename, m, ".c")));
 }
 
+void Pipeline::compile_to_python_extension(const string &filename,
+                                           const vector<Argument> &args,
+                                           const string &fn_name,
+                                           const Target &target) {
+    Module m = compile_to_module(args, fn_name, target);
+    m.compile(Outputs().python_extension(output_name(filename, m, ".py.c")));
+}
+
 void Pipeline::print_loop_nest() {
     user_assert(defined()) << "Can't print loop nest of undefined Pipeline.\n";
     std::cerr << Halide::Internal::print_loop_nest(contents->outputs);
@@ -305,7 +322,7 @@ vector<Argument> Pipeline::infer_arguments(Stmt body) {
     // (we'll embed those in the binary by default), and minus the user_context arg.
     vector<Argument> result;
     for (const InferredArgument &arg : contents->inferred_args) {
-        debug(1) << "Inferred argument: " << arg.arg.type << " " << arg.arg.name << "\n";
+        debug(2) << "Inferred argument: " << arg.arg.type << " " << arg.arg.name << "\n";
         if (!arg.buffer.defined() &&
             arg.arg.name != contents->user_context_arg.arg.name) {
             result.push_back(arg.arg);
@@ -417,6 +434,7 @@ void *Pipeline::compile_jit(const Target &target_arg) {
         debug(2) << "Reusing old jit module compiled for :\n" << contents->jit_target << "\n";
         return contents->jit_module.main_function();
     }
+
     // Clear all cached info in case there is an error.
     contents->invalidate_cache();
 
@@ -735,19 +753,19 @@ void Pipeline::prepare_jit_call_arguments(RealizationArg &outputs, const Target 
                         // Unbound
                         args_result.store[arg_index++] = nullptr;
                     }
-                    debug(1) << "JIT input ImageParam argument ";
+                    debug(2) << "JIT input ImageParam argument ";
                 } else {
                     args_result.store[arg_index++] = p.scalar_address();
-                    debug(1) << "JIT input scalar argument ";
+                    debug(2) << "JIT input scalar argument ";
                 }
             }
         } else {
-            debug(1) << "JIT input Image argument ";
+            debug(2) << "JIT input Image argument ";
             internal_assert(arg.buffer.defined());
             args_result.store[arg_index++] = arg.buffer.raw_buffer();
         }
         const void *ptr = args_result.store[arg_index - 1];
-        debug(1) << arg.arg.name << " @ " << ptr << "\n";
+        debug(2) << arg.arg.name << " @ " << ptr << "\n";
     }
 
     // Then the outputs
@@ -755,16 +773,16 @@ void Pipeline::prepare_jit_call_arguments(RealizationArg &outputs, const Target 
         for (size_t i = 0; i < outputs.r->size(); i++) {
             const halide_buffer_t *buf = (*outputs.r)[i].raw_buffer();
             args_result.store[arg_index++] = buf;
-            debug(1) << "JIT output buffer @ " << (const void *)buf << ", " << buf->host << "\n";
+            debug(2) << "JIT output buffer @ " << (const void *)buf << ", " << (const void *)buf->host << "\n";
         }
     } else if (outputs.buf) {
         args_result.store[arg_index++] = outputs.buf;
-        debug(1) << "JIT output buffer @ " << (const void *)outputs.buf << ", " << outputs.buf->host << "\n";
+        debug(2) << "JIT output buffer @ " << (const void *)outputs.buf << ", " << (const void *)outputs.buf->host << "\n";
     } else {
         for (const Buffer<> &buffer : *outputs.buffer_list) {
             const halide_buffer_t *buf = buffer.raw_buffer();
             args_result.store[arg_index++] = buf;
-            debug(1) << "JIT output buffer @ " << (const void *)buf << ", " << buf->host << "\n";
+            debug(2) << "JIT output buffer @ " << (const void *)buf << ", " << (const void *)buf->host << "\n";
         }
     }
 
@@ -828,13 +846,13 @@ void Pipeline::realize(RealizationArg outputs, const Target &t,
 
     if (outputs.r) {
         for (size_t i = 0; i < outputs.r->size(); i++) {
-            user_assert((*outputs.r)[i].data() != nullptr)
+            user_assert((*outputs.r)[i].data() != nullptr || (*outputs.r)[i].has_device_allocation())
                 << "Buffer at " << &((*outputs.r)[i]) << " is unallocated. "
                 << "The Buffers in a Realization passed to realize must all be allocated\n";
         }
     } else if (outputs.buffer_list) {
-      for (const Buffer<> &buf : *outputs.buffer_list) {
-            user_assert(buf.data() != nullptr)
+        for (const Buffer<> &buf : *outputs.buffer_list) {
+            user_assert(buf.data() != nullptr || buf.has_device_allocation())
                 << "Buffer at " << &buf << " is unallocated. "
                 << "The Buffers in a Realization passed to realize must all be allocated\n";
         }
@@ -988,7 +1006,7 @@ void Pipeline::infer_input_bounds(RealizationArg outputs, const ParamMap &param_
 
     // No need to query if all the inputs are bound already.
     if (query_indices.empty()) {
-        debug(1) << "All inputs are bound. No need for bounds inference\n";
+        debug(2) << "All inputs are bound. No need for bounds inference\n";
         return;
     }
 
@@ -1029,7 +1047,7 @@ void Pipeline::infer_input_bounds(RealizationArg outputs, const ParamMap &param_
         << " didn't converge after " << max_iters
         << " iterations. There may be unsatisfiable constraints\n";
 
-    debug(1) << "Bounds inference converged after " << iter << " iterations\n";
+    debug(2) << "Bounds inference converged after " << iter << " iterations\n";
 
     // Now allocate the resulting buffers
     for (size_t i : query_indices) {

@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #else
 #include "runtime_internal.h"
 #endif
@@ -96,15 +97,21 @@ struct halide_mutex {
     uintptr_t _private[1];
 };
 
+/** Cross platform condition variable. Must be initialized to 0. */
+struct halide_cond {
+    uintptr_t _private[1];
+};
+
 /** A basic set of mutex and condition variable functions, which call
  * platform specific code for mutual exclusion. Equivalent to posix
- * calls. Mutexes should initially be set to zero'd memory. Any
- * resources required are created on first lock. Calling destroy
- * re-zeros the memory.
- */
+ * calls. */
 //@{
 extern void halide_mutex_lock(struct halide_mutex *mutex);
 extern void halide_mutex_unlock(struct halide_mutex *mutex);
+extern void halide_cond_signal(struct halide_cond *cond);
+extern void halide_cond_broadcast(struct halide_cond *cond);
+extern void halide_cond_signal(struct halide_cond *cond);
+extern void halide_cond_wait(struct halide_cond *cond, struct halide_mutex *mutex);
 //@}
 
 /** Define halide_do_par_for to replace the default thread pool
@@ -130,6 +137,93 @@ extern void halide_shutdown_thread_pool();
 typedef int (*halide_do_par_for_t)(void *, halide_task_t, int, int, uint8_t*);
 extern halide_do_par_for_t halide_set_custom_do_par_for(halide_do_par_for_t do_par_for);
 
+/** An opaque struct representing a semaphore. Used by the task system for async tasks. */
+struct halide_semaphore_t {
+    uint64_t _private[2];
+};
+
+/** A struct representing a semaphore and a number of items that must
+ * be acquired from it. Used in halide_parallel_task_t below. */
+struct halide_semaphore_acquire_t {
+    struct halide_semaphore_t *semaphore;
+    int count;
+};
+extern int halide_semaphore_init(struct halide_semaphore_t *, int n);
+extern int halide_semaphore_release(struct halide_semaphore_t *, int n);
+extern bool halide_semaphore_try_acquire(struct halide_semaphore_t *, int n);
+typedef int (*halide_semaphore_init_t)(struct halide_semaphore_t *, int);
+typedef int (*halide_semaphore_release_t)(struct halide_semaphore_t *, int);
+typedef bool (*halide_semaphore_try_acquire_t)(struct halide_semaphore_t *, int);
+
+
+/** A task representing a serial for loop evaluated over some range.
+ * Note that task_parent is a pass through argument that should be
+ * passed to any dependent taks that are invokved using halide_do_parallel_tasks
+ * underneath this call. */
+typedef int (*halide_loop_task_t)(void *user_context, int min, int extent,
+                                  uint8_t *closure, void *task_parent);
+
+/** A parallel task to be passed to halide_do_parallel_tasks. This
+ * task may recursively call halide_do_parallel_tasks, and there may
+ * be complex dependencies between seemingly unrelated tasks expressed
+ * using semaphores. If you are using a custom task system, care must
+ * be taken to avoid potential deadlock. This can be done by carefully
+ * respecting the static metadata at the end of the task struct.*/
+struct halide_parallel_task_t {
+    // The function to call. It takes a user context, a min and
+    // extent, a closure, and a task system pass through argument.
+    halide_loop_task_t fn;
+
+    // The closure to pass it
+    uint8_t *closure;
+
+    // The name of the function to be called. For debugging purposes only.
+    const char *name;
+
+    // An array of semaphores that must be acquired before the
+    // function is called. Must be reacquired for every call made.
+    struct halide_semaphore_acquire_t *semaphores;
+    int num_semaphores;
+
+    // The entire range the function should be called over. This range
+    // may be sliced up and the function called multiple times.
+    int min, extent;
+
+    // A parallel task provides several pieces of metadata to prevent
+    // unbounded resource usage or deadlock.
+
+    // The first is the minimum number of execution contexts (call
+    // stacks or threads) necessary for the function to run to
+    // completion. This may be greater than one when there is nested
+    // parallelism with internal producer-consumer relationships
+    // (calling the function recursively spawns and blocks on parallel
+    // sub-tasks that communicate with each other via semaphores). If
+    // a parallel runtime calls the function when fewer than this many
+    // threads are idle, it may need to create more threads to
+    // complete the task, or else risk deadlock due to committing all
+    // threads to tasks that cannot complete without more.
+    //
+    // FIXME: Note that extern stages are assumed to only require a
+    // single thread to complete. If the extern stage is itself a
+    // Halide pipeline, this may be an underestimate.
+    int min_threads;
+
+    // The calls to the function should be in serial order from min to min+extent-1, with only
+    // one executing at a time. If false, any order is fine, and
+    // concurrency is fine.
+    bool serial;
+};
+
+/** Enqueue some number of the tasks described above and wait for them
+ * to complete. While waiting, the calling threads assists with either
+ * the tasks enqueued, or other non-blocking tasks in the task
+ * system. Note that task_parent should be NULL for top-level calls
+ * and the pass through argument if this call is being made from
+ * another task. */
+extern int halide_do_parallel_tasks(void *user_context, int num_tasks,
+                                    struct halide_parallel_task_t *tasks,
+                                    void *task_parent);
+
 /** If you use the default do_par_for, you can still set a custom
  * handler to perform each individual task. Returns the old handler. */
 //@{
@@ -139,14 +233,52 @@ extern int halide_do_task(void *user_context, halide_task_t f, int idx,
                           uint8_t *closure);
 //@}
 
-/** The default versions of do_task and do_par_for. Can be convenient
- * to call from overrides in certain circumstances. */
+/** The version of do_task called for loop tasks. By default calls the
+ * loop task with the same arguments. */
+// @{
+  typedef int (*halide_do_loop_task_t)(void *, halide_loop_task_t, int, int, uint8_t *, void *);
+extern halide_do_loop_task_t halide_set_custom_do_loop_task(halide_do_loop_task_t do_task);
+extern int halide_do_loop_task(void *user_context, halide_loop_task_t f, int min, int extent,
+                               uint8_t *closure, void *task_parent);
+//@}
+
+/** Provide an entire custom tasking runtime via function
+ * pointers. Note that do_task and semaphore_try_acquire are only ever
+ * called by halide_default_do_par_for and
+ * halide_default_do_parallel_tasks, so it's only necessary to provide
+ * those if you are mixing in the default implementations of
+ * do_par_for and do_parallel_tasks. */
+// @{
+typedef int (*halide_do_parallel_tasks_t)(void *, int, struct halide_parallel_task_t *,
+                                          void *task_parent);
+extern void halide_set_custom_parallel_runtime(
+    halide_do_par_for_t,
+    halide_do_task_t,
+    halide_do_loop_task_t,
+    halide_do_parallel_tasks_t,
+    halide_semaphore_init_t,
+    halide_semaphore_try_acquire_t,
+    halide_semaphore_release_t
+    );
+// @}
+
+/** The default versions of the parallel runtime functions. */
 // @{
 extern int halide_default_do_par_for(void *user_context,
                                      halide_task_t task,
                                      int min, int size, uint8_t *closure);
+extern int halide_default_do_parallel_tasks(void *user_context,
+                                            int num_tasks,
+                                            struct halide_parallel_task_t *tasks,
+                                            void *task_parent);
 extern int halide_default_do_task(void *user_context, halide_task_t f, int idx,
                                   uint8_t *closure);
+extern int halide_default_do_loop_task(void *user_context, halide_loop_task_t f,
+                                       int min, int extent,
+                                       uint8_t *closure, void *task_parent);
+extern int halide_default_semaphore_init(struct halide_semaphore_t *, int n);
+extern int halide_default_semaphore_release(struct halide_semaphore_t *, int n);
+extern bool halide_default_semaphore_try_acquire(struct halide_semaphore_t *, int n);
 // @}
 
 struct halide_thread;
@@ -166,10 +298,6 @@ extern void halide_join_thread(struct halide_thread *);
  * n == 0 : use a reasonable system default (typically, number of cpus online).
  * n == 1 : use exactly one thread; this will always enforce serial execution
  * n > 1  : use a pool of exactly n threads.
- *
- * Note that the default iOS and OSX behavior will treat n > 1 like n == 0;
- * that is, any positive value other than 1 will use a system-determined number
- * of threads.
  *
  * (Note that this is only guaranteed when using the default implementations
  * of halide_do_par_for(); custom implementations may completely ignore values
@@ -299,17 +427,26 @@ struct halide_type_t {
 
     /** Compare two types for equality. */
     HALIDE_ALWAYS_INLINE bool operator==(const halide_type_t &other) const {
-        return (code == other.code &&
-                bits == other.bits &&
-                lanes == other.lanes);
+        return as_u32() == other.as_u32();
     }
 
     HALIDE_ALWAYS_INLINE bool operator!=(const halide_type_t &other) const {
         return !(*this == other);
     }
 
+    HALIDE_ALWAYS_INLINE bool operator<(const halide_type_t &other) const {
+        return as_u32() < other.as_u32();
+    }
+
     /** Size in bytes for a single element, even if width is not 1, of this type. */
     HALIDE_ALWAYS_INLINE int bytes() const { return (bits + 7) / 8; }
+
+private:
+    HALIDE_ALWAYS_INLINE uint32_t as_u32() const {
+        uint32_t u;
+        memcpy(&u, this, sizeof(u));
+        return u;
+    }
 #endif
 };
 
@@ -562,17 +699,22 @@ struct halide_device_interface_t {
                        const struct halide_device_interface_t *dst_device_interface, struct halide_buffer_t *dst);
     int (*device_crop)(void *user_context, const struct halide_buffer_t *src,
                        struct halide_buffer_t *dst);
+    int (*device_slice)(void *user_context, const struct halide_buffer_t *src,
+                        int slice_dim, int slice_pos, struct halide_buffer_t *dst);
     int (*device_release_crop)(void *user_context, struct halide_buffer_t *buf);
     int (*wrap_native)(void *user_context, struct halide_buffer_t *buf, uint64_t handle,
                        const struct halide_device_interface_t *device_interface);
     int (*detach_native)(void *user_context, struct halide_buffer_t *buf);
+    int (*compute_capability)(void *user_context, int *major, int *minor);
     const struct halide_device_interface_impl_t *impl;
 };
 
 /** Release all data associated with the given device interface, in
  * particular all resources (memory, texture, context handles)
  * allocated by Halide. Must be called explicitly when using AOT
- * compilation. */
+ * compilation. This is *not* thread-safe with respect to actively
+ * running Halide code. Ensure all pipelines are finished before
+ * calling this. */
 extern void halide_device_release(void *user_context,
                                   const struct halide_device_interface_t *device_interface);
 
@@ -582,7 +724,7 @@ extern int halide_copy_to_host(void *user_context, struct halide_buffer_t *buf);
 
 /** Copy image data from host memory to device memory. This should not
  * be called directly; Halide handles copying to the device
- * automatically.  If interface is NULL and the bug has a non-zero dev
+ * automatically.  If interface is NULL and the buf has a non-zero dev
  * field, the device associated with the dev handle will be
  * used. Otherwise if the dev field is 0 and interface is NULL, an
  * error is returned. */
@@ -612,15 +754,35 @@ extern int halide_buffer_copy(void *user_context, struct halide_buffer_t *src,
  * up resources associated with the cropped view. Do not free the
  * device allocation on the source buffer while the destination buffer
  * still lives. Note that the two buffers do not share dirty flags, so
- * care must be taken to update them together as needed. Note also
- * that device interfaces which support cropping may still not support
- * cropping a crop. Instead, create a new crop of the parent
- * buffer. */
+ * care must be taken to update them together as needed. Note that src
+ * and dst are required to have the same number of dimensions.
+ *
+ * Note also that (in theory) device interfaces which support cropping may
+ * still not support cropping a crop (instead, create a new crop of the parent
+ * buffer); in practice, no known implementation has this limitation, although
+ * it is possible that some future implementations may require it. */
 extern int halide_device_crop(void *user_context,
                               const struct halide_buffer_t *src,
                               struct halide_buffer_t *dst);
 
-/** Release any resources associated with a cropped view of another
+/** Give the destination buffer a device allocation which is an alias
+ * for a similar coordinate range in the source buffer, but with one dimension
+ * sliced away in the dst. Modifies the device, device_interface, and the
+ * device_dirty flag only. Only supported by some device APIs (others will return
+ * halide_error_code_device_crop_unsupported). Call
+ * halide_device_release_crop instead of halide_device_free to clean
+ * up resources associated with the sliced view. Do not free the
+ * device allocation on the source buffer while the destination buffer
+ * still lives. Note that the two buffers do not share dirty flags, so
+ * care must be taken to update them together as needed. Note that the dst buffer
+ * must have exactly one fewer dimension than the src buffer, and that slice_dim
+ * and slice_pos must be valid within src. */
+extern int halide_device_slice(void *user_context,
+                               const struct halide_buffer_t *src,
+                               int slice_dim, int slice_pos,
+                               struct halide_buffer_t *dst);
+
+/** Release any resources associated with a cropped/sliced view of another
  * buffer. */
 extern int halide_device_release_crop(void *user_context,
                                       struct halide_buffer_t *buf);
@@ -944,11 +1106,11 @@ enum halide_error_code_t {
      * string to see more details. */
     halide_error_code_device_buffer_copy_failed = -39,
 
-    /** Attempted to make cropped alias of a buffer with a device
+    /** Attempted to make cropped/sliced alias of a buffer with a device
      * field, but the device_interface does not support cropping. */
     halide_error_code_device_crop_unsupported = -40,
 
-    /** Cropping a buffer failed for some other reason. Turn on -debug
+    /** Cropping/slicing a buffer failed for some other reason. Turn on -debug
      * in your target string. */
     halide_error_code_device_crop_failed = -41,
 
@@ -957,6 +1119,14 @@ enum halide_error_code_t {
      * existed on a different device interface. Free the old one
      * first. */
     halide_error_code_incompatible_device_interface = -42,
+
+    /** The dimensions field of a halide_buffer_t does not match the dimensions of that ImageParam. */
+    halide_error_code_bad_dimensions = -43,
+
+    /** An expression that would perform an integer division or modulo
+     * by zero was evaluated. */
+    halide_error_code_integer_division_by_zero = -44,
+
 };
 
 /** Halide calls the functions below on various error conditions. The
@@ -982,6 +1152,8 @@ extern int halide_error_bad_type(void *user_context, const char *func_name,
                                  uint8_t code_given, uint8_t correct_code,
                                  uint8_t bits_given, uint8_t correct_bits,
                                  uint16_t lanes_given, uint16_t correct_lanes);
+extern int halide_error_bad_dimensions(void *user_context, const char *func_name,
+                                       int32_t dimensions_given, int32_t correct_dimensions);
 extern int halide_error_access_out_of_bounds(void *user_context, const char *func_name,
                                              int dimension, int min_touched, int max_touched,
                                              int min_valid, int max_valid);
@@ -1033,7 +1205,7 @@ extern int halide_error_no_device_interface(void *user_context);
 extern int halide_error_device_interface_no_device(void *user_context);
 extern int halide_error_host_and_device_dirty(void *user_context);
 extern int halide_error_buffer_is_null(void *user_context, const char *routine);
-
+extern int halide_error_integer_division_by_zero(void *user_context);
 // @}
 
 /** Optional features a compilation Target can have.
@@ -1105,7 +1277,15 @@ typedef enum halide_target_feature_t {
     halide_target_feature_cl_half = 49,  ///< Enable half support on OpenCL targets
     halide_target_feature_strict_float = 50, ///< Turn off all non-IEEE floating-point optimization. Currently applies only to LLVM targets.
     halide_target_feature_legacy_buffer_wrappers = 51,  ///< Emit legacy wrapper code for buffer_t (vs halide_buffer_t) when AOT-compiled.
-    halide_target_feature_end = 52, ///< A sentinel. Every target is considered to have this feature, and setting this feature does nothing.
+    halide_target_feature_tsan = 52, ///< Enable hooks for TSAN support.
+    halide_target_feature_asan = 53, ///< Enable hooks for ASAN support.
+    halide_target_feature_d3d12compute = 54, ///< Enable Direct3D 12 Compute runtime.
+    halide_target_feature_check_unsafe_promises = 55, ///< Insert assertions for promises.
+    halide_target_feature_hexagon_dma = 56, ///< Enable Hexagon DMA buffers.
+    halide_target_feature_embed_bitcode = 57,  ///< Emulate clang -fembed-bitcode flag.
+    halide_target_feature_disable_llvm_loop_vectorize = 58,  ///< Disable loop vectorization in LLVM. (Ignored for non-LLVM targets.)
+    halide_target_feature_disable_llvm_loop_unroll = 59,  ///< Disable loop unrolling in LLVM. (Ignored for non-LLVM targets.)
+    halide_target_feature_end = 60 ///< A sentinel. Every target is considered to have this feature, and setting this feature does nothing.
 } halide_target_feature_t;
 
 /** This function is called internally by Halide in some situations to determine
@@ -1121,10 +1301,13 @@ typedef enum halide_target_feature_t {
  * while a return value of 1 means "It is not obviously unsafe to use code compiled with these features".
  *
  * The default implementation simply calls halide_default_can_use_target_features.
+ *
+ * Note that `features` points to an array of `count` uint64_t; this array must contain enough
+ * bits to represent all the currently known features. Any excess bits must be set to zero.
  */
 // @{
-extern int halide_can_use_target_features(uint64_t features);
-typedef int (*halide_can_use_target_features_t)(uint64_t);
+extern int halide_can_use_target_features(int count, const uint64_t *features);
+typedef int (*halide_can_use_target_features_t)(int count, const uint64_t *features);
 extern halide_can_use_target_features_t halide_set_custom_can_use_target_features(halide_can_use_target_features_t);
 // @}
 
@@ -1133,16 +1316,16 @@ extern halide_can_use_target_features_t halide_set_custom_can_use_target_feature
  * for convenience of user code that may wish to extend halide_can_use_target_features
  * but continue providing existing support, e.g.
  *
- *     int halide_can_use_target_features(uint64_t features) {
- *          if (features & halide_target_somefeature) {
+ *     int halide_can_use_target_features(int count, const uint64_t *features) {
+ *          if (features[halide_target_somefeature >> 6] & (1LL << (halide_target_somefeature & 63))) {
  *              if (!can_use_somefeature()) {
  *                  return 0;
  *              }
  *          }
- *          return halide_default_can_use_target_features(features);
+ *          return halide_default_can_use_target_features(count, features);
  *     }
  */
-extern int halide_default_can_use_target_features(uint64_t features);
+extern int halide_default_can_use_target_features(int count, const uint64_t *features);
 
 
 typedef struct halide_dimension_t {
@@ -1344,12 +1527,14 @@ typedef struct buffer_t {
 #endif // BUFFER_T_DEFINED
 
 /** Copies host pointer, mins, extents, strides, and device state from
- * an old-style buffer_t into a new-style halide_buffer_t. The
- * dimensions and type fields of the new buffer_t should already be
- * set. Returns an error code if the upgrade could not be
- * performed. */
+ * an old-style buffer_t into a new-style halide_buffer_t. If bounds_query_only is nonzero,
+ * the copy is only done if the old_buf has null host and dev (ie, a bounds query is being
+ * performed); otherwise new_buf is left untouched. (This is used for input buffers to avoid
+ * benign data races.) The dimensions and type fields of the new buffer_t should already be
+ * set. Returns an error code if the upgrade could not be performed. */
 extern int halide_upgrade_buffer_t(void *user_context, const char *name,
-                                   const buffer_t *old_buf, halide_buffer_t *new_buf);
+                                   const buffer_t *old_buf, halide_buffer_t *new_buf,
+                                   int bounds_query_only);
 
 /** Copies the host pointer, mins, extents, strides, and device state
  * from a halide_buffer_t to a buffer_t. Also sets elem_size. Useful
@@ -1385,6 +1570,9 @@ struct halide_scalar_value_t {
         double f64;
         void *handle;
     } u;
+    #ifdef __cplusplus
+    HALIDE_ALWAYS_INLINE halide_scalar_value_t() {u.u64 = 0;}
+    #endif
 };
 
 enum halide_argument_kind_t {
@@ -1405,6 +1593,18 @@ enum halide_argument_kind_t {
 */
 
 /**
+ * Obsolete version of halide_filter_argument_t; only present in
+ * code that wrote halide_filter_metadata_t version 0.
+ */
+struct halide_filter_argument_t_v0 {
+    const char *name;
+    int32_t kind;
+    int32_t dimensions;
+    struct halide_type_t type;
+    const struct halide_scalar_value_t *def, *min, *max;
+};
+
+/**
  * halide_filter_argument_t is essentially a plain-C-struct equivalent to
  * Halide::Argument; most user code will never need to create one.
  */
@@ -1415,14 +1615,22 @@ struct halide_filter_argument_t {
     struct halide_type_t type;
     // These pointers should always be null for buffer arguments,
     // and *may* be null for scalar arguments. (A null value means
-    // there is no def/min/max specified for this argument.)
-    const struct halide_scalar_value_t *def;
-    const struct halide_scalar_value_t *min;
-    const struct halide_scalar_value_t *max;
+    // there is no def/min/max/estimate specified for this argument.)
+    const struct halide_scalar_value_t *scalar_def, *scalar_min, *scalar_max, *scalar_estimate;
+    // This pointer should always be null for scalar arguments,
+    // and *may* be null for buffer arguments. If not null, it should always
+    // point to an array of dimensions*2 pointers, which will be the (min, extent)
+    // estimates for each dimension of the buffer. (Note that any of the pointers
+    // may be null as well.)
+    int64_t const* const* buffer_estimates;
 };
 
 struct halide_filter_metadata_t {
-    /** version of this metadata; currently always 0. */
+#ifdef __cplusplus
+    static const int32_t VERSION = 1;
+#endif
+
+    /** version of this metadata; currently always 1. */
     int32_t version;
 
     /** The number of entries in the arguments field. This is always >= 1. */

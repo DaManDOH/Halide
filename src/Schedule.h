@@ -6,8 +6,8 @@
  */
 
 #include "Expr.h"
-#include "Parameter.h"
 #include "FunctionPtr.h"
+#include "Parameter.h"
 
 #include <map>
 
@@ -393,6 +393,10 @@ public:
     bool memoized() const;
     // @}
 
+    /** Is the production of this Function done asynchronously */
+    bool &async();
+    bool async() const;
+
     /** The list and order of dimensions used to store this
      * function. The first dimension in the vector corresponds to the
      * innermost dimension for storage (i.e. which dimension is
@@ -547,7 +551,7 @@ public:
     void mutate(IRMutator2 *);
 };
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide
 
 #endif

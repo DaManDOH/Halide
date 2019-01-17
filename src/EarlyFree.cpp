@@ -1,13 +1,14 @@
 #include <map>
 
 #include "EarlyFree.h"
-#include "IRMutator.h"
-#include "IREquality.h"
 #include "ExprUsesVar.h"
+#include "IREquality.h"
+#include "IRMutator.h"
 #include "InjectHostDevBufferCopies.h"
 
 namespace Halide {
 namespace Internal {
+namespace {
 
 using std::map;
 using std::string;
@@ -26,35 +27,48 @@ private:
 
     using IRVisitor::visit;
 
-    void visit(const For *loop) {
+    void visit(const For *loop) override {
         loop->min.accept(this);
         loop->extent.accept(this);
         ScopedValue<bool> old_in_loop(in_loop, true);
         loop->body.accept(this);
     }
 
-    void visit(const Load *load) {
+    void visit(const Fork *fork) override {
+        ScopedValue<bool> old_in_loop(in_loop, true);
+        fork->first.accept(this);
+        fork->rest.accept(this);
+    }
+
+    void visit(const Acquire *acq) override {
+        acq->semaphore.accept(this);
+        acq->count.accept(this);
+        ScopedValue<bool> old_in_loop(in_loop, true);
+        acq->body.accept(this);
+    }
+
+    void visit(const Load *load) override {
         if (func == load->name) {
             last_use = containing_stmt;
         }
         IRVisitor::visit(load);
     }
 
-    void visit(const Call *call) {
+    void visit(const Call *call) override {
         if (call->name == func) {
             last_use = containing_stmt;
         }
         IRVisitor::visit(call);
     }
 
-    void visit(const Store *store) {
+    void visit(const Store *store) override {
         if (func == store->name) {
             last_use = containing_stmt;
         }
         IRVisitor::visit(store);
     }
 
-    void visit(const Variable *var) {
+    void visit(const Variable *var) override {
         if (var->name == func || var->name == func + ".buffer") {
             // Don't free the allocation while a buffer that may refer
             // to it is still in use.
@@ -62,7 +76,7 @@ private:
         }
     }
 
-    void visit(const IfThenElse *op) {
+    void visit(const IfThenElse *op) override {
         // It's a bad idea to inject it in either side of an
         // ifthenelse, so we treat this as being in a loop.
         op->condition.accept(this);
@@ -73,18 +87,16 @@ private:
         }
     }
 
-    void visit(const Block *block) {
+    void visit(const Block *block) override {
         if (in_loop) {
             IRVisitor::visit(block);
         } else {
-            Stmt old_containing_stmt = containing_stmt;
-            containing_stmt = block->first;
+            ScopedValue<Stmt> old_containing_stmt(containing_stmt, block->first);
             block->first.accept(this);
             if (block->rest.defined()) {
                 containing_stmt = block->rest;
                 block->rest.accept(this);
             }
-            containing_stmt = old_containing_stmt;
         }
     }
 };
@@ -150,10 +162,12 @@ class InjectEarlyFrees : public IRMutator2 {
     }
 };
 
+}  // namespace
+
 Stmt inject_early_frees(Stmt s) {
     InjectEarlyFrees early_frees;
     return early_frees.mutate(s);
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide

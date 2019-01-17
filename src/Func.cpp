@@ -1,54 +1,53 @@
 #include <algorithm>
 #include <iostream>
 #include <string.h>
-#include <fstream>
 
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
 
-#include "IR.h"
+#include "ApplySplit.h"
+#include "Argument.h"
+#include "Associativity.h"
+#include "CodeGen_LLVM.h"
+#include "Debug.h"
+#include "ExprUsesVar.h"
 #include "Func.h"
-#include "Util.h"
+#include "Function.h"
+#include "IR.h"
+#include "IREquality.h"
+#include "IRMutator.h"
 #include "IROperator.h"
 #include "IRPrinter.h"
-#include "IRMutator.h"
-#include "Function.h"
-#include "Argument.h"
+#include "ImageParam.h"
+#include "LLVM_Headers.h"
+#include "LLVM_Output.h"
 #include "Lower.h"
+#include "Outputs.h"
 #include "Param.h"
 #include "PrintLoopNest.h"
-#include "Debug.h"
-#include "IREquality.h"
-#include "CodeGen_LLVM.h"
-#include "LLVM_Headers.h"
-#include "Outputs.h"
-#include "LLVM_Output.h"
-#include "Substitute.h"
-#include "ExprUsesVar.h"
 #include "Simplify.h"
 #include "Solve.h"
-#include "Associativity.h"
-#include "ApplySplit.h"
-#include "ImageParam.h"
+#include "Substitute.h"
+#include "Util.h"
 
 namespace Halide {
 
+using std::map;
 using std::max;
 using std::min;
-using std::map;
+using std::ofstream;
+using std::pair;
 using std::string;
 using std::vector;
-using std::pair;
-using std::ofstream;
 
 using namespace Internal;
 
 Func::Func(const string &name) : func(unique_name(name)) {}
 
-Func::Func() : func(make_entity_name(this, "Halide::Func", 'f')) {}
+Func::Func() : func(make_entity_name(this, "Halide:.*:Func", 'f')) {}
 
-Func::Func(Expr e) : func(make_entity_name(this, "Halide::Func", 'f')) {
+Func::Func(Expr e) : func(make_entity_name(this, "Halide:.*:Func", 'f')) {
     (*this)(_) = e;
 }
 
@@ -163,15 +162,13 @@ void Func::define_extern(const std::string &function_name,
                          const std::vector<ExternFuncArgument> &args,
                          const std::vector<Type> &types,
                          const std::vector<Var> &arguments,
-                         NameMangling mangling,
-                         DeviceAPI device_api,
-                         bool uses_old_buffer_t) {
-    vector<string> dim_names(arguments.size());
-    for (size_t i = 0; i < arguments.size(); i++) {
-        dim_names[i] = arguments[i].name();
-    }
-    func.define_extern(function_name, args, types, dim_names,
-                       mangling, device_api, uses_old_buffer_t);
+                         NameMangling mangling, DeviceAPI device_api) {
+  vector<string> dim_names(arguments.size());
+  for (size_t i = 0; i < arguments.size(); i++) {
+    dim_names[i] = arguments[i].name();
+  }
+  func.define_extern(function_name, args, types, dim_names, mangling,
+                     device_api);
 }
 
 /** Get the types of the buffers returned by an extern definition. */
@@ -924,6 +921,10 @@ void Stage::split(const string &old, const string &outer, const string &inner, E
             dims.insert(dims.begin() + i, dims[i]);
             dims[i].var = inner_name;
             dims[i+1].var = outer_name;
+            if (dims[i].for_type == ForType::Extern) {
+                // If we split an extern loop, mark the outer loop serial.
+                dims[i+1].for_type = ForType::Serial;
+            }
         }
     }
 
@@ -1129,7 +1130,7 @@ public:
     string offending_var;
 protected:
     using IRGraphVisitor::visit;
-    void visit(const Variable *var) {
+    void visit(const Variable *var) override {
         if (!var->param.defined() && !var->image.defined()) {
             offending_var = var->name;
         }
@@ -1486,14 +1487,16 @@ Stage &Stage::tile(VarOrRVar x, VarOrRVar y,
     return *this;
 }
 
-namespace {
-// An helper function for reordering vars in a schedule.
-void reorder_vars(vector<Dim> &dims_old, const VarOrRVar *vars, size_t size, const Stage &stage) {
+Stage &Stage::reorder(const std::vector<VarOrRVar>& vars) {
+    const string &func_name = function.name();
+    vector<Expr> &args = definition.args();
+    vector<Expr> &values = definition.values();
+    vector<Dim> &dims_old = definition.schedule().dims();
     vector<Dim> dims = dims_old;
 
     // Tag all the vars with their locations in the dims list.
-    vector<size_t> idx(size);
-    for (size_t i = 0; i < size; i++) {
+    vector<size_t> idx(vars.size());
+    for (size_t i = 0; i < vars.size(); i++) {
         bool found = false;
         for (size_t j = 0; j < dims.size(); j++) {
             if (var_name_match(dims[j].var, vars[i].name())) {
@@ -1502,24 +1505,33 @@ void reorder_vars(vector<Dim> &dims_old, const VarOrRVar *vars, size_t size, con
             }
         }
         user_assert(found)
-            << "In schedule for " << stage.name()
+            << "In schedule for " << name()
             << ", could not find var " << vars[i].name()
             << " to reorder in the argument list.\n"
-            << stage.dump_argument_list();
+            << dump_argument_list();
     }
 
-    // Look for illegal reorderings
-    for (size_t i = 0; i < idx.size(); i++) {
-        if (dims[idx[i]].is_pure()) continue;
-        for (size_t j = i+1; j < idx.size(); j++) {
-            if (dims[idx[j]].is_pure()) continue;
-
-            if (idx[i] > idx[j]) {
-                user_error
-                    << "In schedule for " << stage.name()
-                    << ", can't reorder RVars " << vars[i].name()
-                    << " and " << vars[j].name()
-                    << " because it may change the meaning of the algorithm.\n";
+    // It is illegal to reorder RVars if the stage is not associative
+    // or not commutative. Look for RVar reorderings and try to do the
+    // necessary proof if any are found.
+    bool associativity_proven = false;
+    for (size_t i = 0; !associativity_proven && i < idx.size(); i++) {
+        if (!dims[idx[i]].is_pure()) {
+            for (size_t j = i+1; !associativity_proven && j < idx.size(); j++) {
+                if (!dims[idx[j]].is_pure() && (idx[i] > idx[j])) {
+                    // Generate an error if the operator is not both associative and commutative.
+                    const auto &prover_result = prove_associativity(func_name, args, values);
+                    associativity_proven = prover_result.associative() &&
+                                           prover_result.commutative();
+                    if (!associativity_proven) {
+                        user_error
+                            << "In schedule for " << name()
+                            << ", can't reorder RVars " << vars[i].name()
+                            << " and " << vars[j].name()
+                            << " because it may change the meaning of the "
+                            << "algorithm.\n";
+                    }
+                }
             }
         }
     }
@@ -1528,16 +1540,12 @@ void reorder_vars(vector<Dim> &dims_old, const VarOrRVar *vars, size_t size, con
     vector<size_t> sorted = idx;
     std::sort(sorted.begin(), sorted.end());
 
-    for (size_t i = 0; i < size; i++) {
+    for (size_t i = 0; i < vars.size(); i++) {
         dims[sorted[i]] = dims_old[idx[i]];
     }
 
     dims_old.swap(dims);
-}
-}
 
-Stage &Stage::reorder(const std::vector<VarOrRVar>& vars) {
-    reorder_vars(definition.schedule().dims(), &vars[0], vars.size(), *this);
     return *this;
 }
 
@@ -1935,7 +1943,7 @@ Func Func::copy_to_device(DeviceAPI d) {
     ExternFuncArgument device_interface = make_device_interface_call(d);
     func.define_extern("halide_buffer_copy", {buffer, device_interface},
                        {call->type}, func.args(), // Reuse the existing dimension names
-                       NameMangling::C, d, false);
+                       NameMangling::C, d);
     return *this;
 }
 
@@ -1983,6 +1991,12 @@ Func &Func::memoize() {
 Func &Func::store_in(MemoryType t) {
     invalidate_cache();
     func.schedule().memory_type() = t;
+    return *this;
+}
+
+Func &Func::async() {
+    invalidate_cache();
+    func.schedule().async() = true;
     return *this;
 }
 
@@ -2058,6 +2072,12 @@ Func &Func::bound(Var var, Expr min, Expr extent) {
 
     Bound b = {var.name(), min, extent, Expr(), Expr()};
     func.schedule().bounds().push_back(b);
+
+    // Propagate constant bounds into estimates as well.
+    if (!is_const(min)) min = Expr();
+    if (!is_const(extent)) extent = Expr();
+    estimate(var, min, extent);
+
     return *this;
 }
 
@@ -2072,6 +2092,26 @@ Func &Func::estimate(Var var, Expr min, Expr extent) {
 
     Bound b = {var.name(), min, extent, Expr(), Expr()};
     func.schedule().estimates().push_back(b);
+
+    // Propagate the estimate into the Parameter as well, so that
+    // the values in the metadata will be correct.
+    const auto &arg_names = func.args();
+    int dim = -1;
+    for (size_t i = 0; i < arg_names.size(); ++i) {
+        if (arg_names[i] == var.name()) {
+            dim = i;
+            break;
+        }
+    }
+    internal_assert(dim >= 0);
+    for (auto param : func.output_buffers()) {
+        if (min.defined()) {
+            param.set_min_constraint_estimate(dim, min);
+        }
+        if (extent.defined()) {
+            param.set_extent_constraint_estimate(dim, extent);
+        }
+    }
     return *this;
 }
 
@@ -2496,7 +2536,7 @@ public:
 
     using IRGraphVisitor::visit;
 
-    void visit(const Variable *v) {
+    void visit(const Variable *v) override {
         int index = Var::implicit_index(v->name);
         if (index != -1) {
             if (index >= count) count = index + 1;
@@ -2867,13 +2907,17 @@ void Func::infer_input_bounds(int x_size, int y_size, int z_size, int w_size,
     int sizes[] = {x_size, y_size, z_size, w_size};
     for (size_t i = 0; i < outputs.size(); i++) {
         // We're not actually going to read from these outputs, so
-        // make the allocation tiny, then expand them with unsafe
-        // cropping.
+        // make the allocation tiny, then "expand" them by directly manipulating
+        // the halide_buffer_t fields. (We can't use crop because it explicitly
+        // disallows expanding the fields in this unsafe manner.)
         Buffer<> im = Buffer<>::make_scalar(func.output_types()[i]);
         for (int s : sizes) {
             if (!s) break;
             im.add_dimension();
-            im.crop(im.dimensions()-1, 0, s);
+            // buf.host is going to be wrong no matter what, so don't
+            // bother adjusting it.
+            im.raw_buffer()->dim[im.dimensions()-1].min = 0;
+            im.raw_buffer()->dim[im.dimensions()-1].extent = s;
         }
         outputs[i] = std::move(im);
     }
@@ -2977,6 +3021,13 @@ void Func::compile_to_lowered_stmt(const string &filename,
     pipeline().compile_to_lowered_stmt(filename, args, fmt, target);
 }
 
+void Func::compile_to_python_extension(const string &filename_prefix,
+                                       const vector<Argument> &args,
+                                       const string &fn_name,
+                                       const Target &target) {
+    pipeline().compile_to_python_extension(filename_prefix, args, fn_name, target);
+}
+
 void Func::print_loop_nest() {
     pipeline().print_loop_nest();
 }
@@ -3071,4 +3122,4 @@ Var _("_");
 Var _0("_0"), _1("_1"), _2("_2"), _3("_3"), _4("_4"),
            _5("_5"), _6("_6"), _7("_7"), _8("_8"), _9("_9");
 
-}
+}  // namespace Halide

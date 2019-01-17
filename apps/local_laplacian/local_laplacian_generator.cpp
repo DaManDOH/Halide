@@ -89,19 +89,23 @@ public:
 
         /* THE SCHEDULE */
 
+        // Provide estimates on the input image.
+        // (This can be useful in conjunction with RunGen as well
+        // as auto-schedule, so we do it in all cases.)
+        input.dim(0).set_bounds_estimate(0, 1536);
+        input.dim(1).set_bounds_estimate(0, 2560);
+        input.dim(2).set_bounds_estimate(0, 3);
+        // Provide estimates on the parameters
+        levels.set_estimate(8);
+        alpha.set_estimate(1);
+        beta.set_estimate(1);
+        // Provide estimates on the pipeline output
+        output.estimate(x, 0, 1536)
+              .estimate(y, 0, 2560)
+              .estimate(c, 0, 3);
+
         if (auto_schedule) {
-            // Provide estimates on the input image
-            input.dim(0).set_bounds_estimate(0, 1536);
-            input.dim(1).set_bounds_estimate(0, 2560);
-            input.dim(2).set_bounds_estimate(0, 3);
-            // Provide estimates on the parameters
-            levels.set_estimate(8);
-            alpha.set_estimate(1);
-            beta.set_estimate(1);
-            // Provide estimates on the pipeline output
-            output.estimate(x, 0, 1536)
-                .estimate(y, 0, 2560)
-                .estimate(c, 0, 3);
+            // Nothing.
         } else if (get_target().has_gpu_feature()) {
             // gpu schedule
             remap.compute_root();
@@ -170,26 +174,23 @@ public:
             for (int j = 0; j < i; ++j) {
                 y += 500 >> j;
             }
-            if (i > 0) {
+            {
                 int x = 370;
                 int store_cost = 1 << (i + 1);
                 Halide::Trace::FuncConfig cfg;
                 cfg.pos = {x, y};
                 cfg.store_cost = store_cost;
-                cfg.auto_label = false;
                 inGPyramid[i].add_trace_tag(cfg.to_trace_tag());
             }
-            if (i > 0) {
+            {
                 int x = 720;
                 int store_cost = 1 << i;
                 Halide::Trace::FuncConfig cfg;
                 cfg.strides = {{1, 0}, {0, 1}, {200, 0}};
                 cfg.pos = {x, y};
                 cfg.store_cost = store_cost;
-                cfg.auto_label = false;
                 if (i == 1) {
                     cfg.labels = { { "differently curved intermediate pyramids" } };
-                    cfg.pos = {x, 100};
                 }
                 gPyramid[i].add_trace_tag(cfg.to_trace_tag());
             }
@@ -199,7 +200,6 @@ public:
                 Halide::Trace::FuncConfig cfg;
                 cfg.pos = {x, y};
                 cfg.store_cost = store_cost;
-                cfg.auto_label = false;
                 if (i == 0) {
                     cfg.labels = { { "output pyramids" } };
                     cfg.pos = {x, 100};

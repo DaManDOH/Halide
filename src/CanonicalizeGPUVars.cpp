@@ -11,8 +11,8 @@ namespace Halide {
 namespace Internal {
 
 using std::map;
-using std::vector;
 using std::string;
+using std::vector;
 
 namespace {
 string thread_names[] = {"__thread_id_x", "__thread_id_y", "__thread_id_z", "__thread_id_w"};
@@ -33,7 +33,7 @@ class CountGPUBlocksThreads : public IRVisitor {
 
     using IRVisitor::visit;
 
-    void visit(const For *op) {
+    void visit(const For *op) override {
         if (starts_with(op->name, prefix)) {
             if (op->for_type == ForType::GPUBlock) {
                 nblocks++;
@@ -46,7 +46,7 @@ class CountGPUBlocksThreads : public IRVisitor {
         IRVisitor::visit(op);
     }
 
-    void visit(const IfThenElse *op) {
+    void visit(const IfThenElse *op) override {
         op->condition.accept(this);
 
         int old_nblocks = nblocks;
@@ -207,7 +207,7 @@ class CanonicalizeGPUVars : public IRMutator2 {
     }
 };
 
-} // anonymous namespace
+}  // anonymous namespace
 
 Stmt canonicalize_gpu_vars(Stmt s) {
     CanonicalizeGPUVars canonicalizer;
@@ -215,5 +215,5 @@ Stmt canonicalize_gpu_vars(Stmt s) {
     return s;
 }
 
-}
-}
+}  // namespace Internal
+}  // namespace Halide
